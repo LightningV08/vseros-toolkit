@@ -42,9 +42,8 @@ class CoVisGenerator(CandidateGenerator):
         schema: Schema,
         rng: np.random.RandomState,
     ) -> "CoVisGenerator":
-        cutoff_ts = pd.to_datetime(cutoff_ts, utc=True)
         interactions = filter_by_cutoff(interactions, cutoff_ts, ts_col="ts")
-        cutoff_lower = cutoff_ts - pd.Timedelta(days=self.params["window_days"])
+        cutoff_lower = pd.to_datetime(cutoff_ts) - pd.Timedelta(days=self.params["window_days"])
         interactions = interactions[interactions["ts"] >= cutoff_lower]
         interactions = interactions.sort_values("ts")
 
