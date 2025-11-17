@@ -5,7 +5,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import hashlib
 import numpy as np
+
 from .utils import ensure_numpy
+
+# tqdm — аккуратно, чтобы не падать, если его нет в окружении
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 
 @dataclass
 class EmbeddingCache:
@@ -53,6 +61,7 @@ def _encode_batch(
 ) -> np.ndarray:
     """
     Внутренняя обёртка над emb_model.encode(...) для одного батча.
+    Без логов и tqdm — логика логирования живёт на уровне encode_docs_with_cache.
     """
     if not texts:
         return np.zeros((0, 0), dtype="float32")
@@ -87,6 +96,8 @@ def encode_docs_with_cache(
     cache: Optional[EmbeddingCache] = None,
     batch_size: int = 32,
     normalize: bool = True,
+    show_progress: bool = False,
+    verbose: bool = False,
 ) -> np.ndarray:
     """
     Считает эмбеддинги для списка текстов, по возможности используя кэш.
@@ -106,6 +117,11 @@ def encode_docs_with_cache(
         Размер батча для encode (используется только для новых текстов).
     normalize:
         Нормализовать ли эмбеддинги по L2.
+    show_progress:
+        Если True и установлен tqdm — показывает прогресс-бар по батчам
+        (особенно полезно на больших корпусах).
+    verbose:
+        Если True — печатает полезные логи: размеры, долю кэша, форму матрицы и т.п.
 
     Возвращает
     ----------
@@ -113,14 +129,38 @@ def encode_docs_with_cache(
         Матрица эмбеддингов shape = (len(texts), dim).
     """
     texts = [t if t is not None else "" for t in texts]
+    n_texts = len(texts)
 
-    if len(texts) == 0:
+    if n_texts == 0:
+        if verbose:
+            print("[encode_docs_with_cache] пустой список текстов, возвращаю (0, 0).")
         return np.zeros((0, 0), dtype="float32")
 
-    # Если кэша нет или нет model_id — просто считаем всё "как есть"
-    if cache is None or model_id is None:
+    use_cache = cache is not None and model_id is not None
+
+    if verbose:
+        print(
+            f"[encode_docs_with_cache] n_texts={n_texts}, "
+            f"batch_size={batch_size}, normalize={normalize}, "
+            f"use_cache={use_cache}, model_id={model_id!r}"
+        )
+
+    # =========================
+    # Вариант без кэша
+    # =========================
+    if not use_cache:
+        if verbose:
+            print("[encode_docs_with_cache] cache=None или model_id=None — считаем всё без кэша.")
+
         all_vecs: List[np.ndarray] = []
-        for start in range(0, len(texts), batch_size):
+
+        iter_range = range(0, n_texts, batch_size)
+        if show_progress and tqdm is not None and n_texts > batch_size:
+            iter_range = tqdm(iter_range, desc="Encoding docs (no cache)", unit="batch")
+        elif show_progress and tqdm is None and verbose:
+            print("[encode_docs_with_cache] tqdm не установлен, прогресс-бар отключён.")
+
+        for start in iter_range:
             batch = texts[start : start + batch_size]
             if not batch:
                 continue
@@ -128,13 +168,20 @@ def encode_docs_with_cache(
             all_vecs.append(arr)
 
         if not all_vecs:
+            if verbose:
+                print("[encode_docs_with_cache] не удалось получить ни одного батча, возвращаю (0, 0).")
             return np.zeros((0, 0), dtype="float32")
 
-        return np.vstack(all_vecs)
+        emb = np.vstack(all_vecs)
+        if verbose:
+            print(f"[encode_docs_with_cache] готово (no cache). shape={emb.shape}")
+        return emb
 
-    # --- Используем кэш ---
+    # =========================
+    # Вариант с кэшем
+    # =========================
 
-    # Сначала определим, что уже есть в кэше
+    # Сначала определим, какие тексты уже есть в кэше
     keys: List[Tuple[str, bool, str]] = []
     cached_vecs: Dict[int, np.ndarray] = {}
     missing_indices: List[int] = []
@@ -147,15 +194,30 @@ def encode_docs_with_cache(
         else:
             missing_indices.append(i)
 
+    if verbose:
+        print(
+            f"[encode_docs_with_cache] cache stats: "
+            f"total={n_texts}, cached={len(cached_vecs)}, missing={len(missing_indices)}"
+        )
+
     new_vecs: Dict[int, np.ndarray] = {}
 
     # Для "пропавших" считаем эмбеддинги батчами
     if missing_indices:
-        # Собираем тексты, которых нет в кэше
         missing_texts = [texts[i] for i in missing_indices]
 
+        if verbose:
+            print(f"[encode_docs_with_cache] считаю эмбеддинги для {len(missing_texts)} новых текстов...")
+
         all_vecs: List[np.ndarray] = []
-        for start in range(0, len(missing_texts), batch_size):
+
+        iter_range = range(0, len(missing_texts), batch_size)
+        if show_progress and tqdm is not None and len(missing_texts) > batch_size:
+            iter_range = tqdm(iter_range, desc="Encoding missing docs", unit="batch")
+        elif show_progress and tqdm is None and verbose:
+            print("[encode_docs_with_cache] tqdm не установлен, прогресс-бар отключён.")
+
+        for start in iter_range:
             batch = missing_texts[start : start + batch_size]
             if not batch:
                 continue
@@ -179,13 +241,21 @@ def encode_docs_with_cache(
                 if cache._can_store_more():
                     cache.doc_cache[key] = v
 
+        if verbose and cache.max_size is not None:
+            print(
+                "[encode_docs_with_cache] doc_cache size после обновления: "
+                f"{len(cache.doc_cache)} (max_size={cache.max_size})"
+            )
+
     # Если вообще нет векторов (маловероятно), вернём пустую матрицу
     if not (cached_vecs or new_vecs):
-        return np.zeros((len(texts), 0), dtype="float32")
+        if verbose:
+            print("[encode_docs_with_cache] ни cached_vecs, ни new_vecs — возвращаю (n_texts, 0).")
+        return np.zeros((n_texts, 0), dtype="float32")
 
     # Определяем размерность по любому найденному вектору
     any_vec: Optional[np.ndarray] = None
-    for i in range(len(texts)):
+    for i in range(n_texts):
         if i in new_vecs:
             any_vec = new_vecs[i]
             break
@@ -194,19 +264,26 @@ def encode_docs_with_cache(
             break
 
     if any_vec is None:
-        return np.zeros((len(texts), 0), dtype="float32")
+        if verbose:
+            print("[encode_docs_with_cache] не удалось найти ни одного вектора, возвращаю (n_texts, 0).")
+        return np.zeros((n_texts, 0), dtype="float32")
 
     dim = any_vec.shape[-1]
-    embeddings = np.zeros((len(texts), dim), dtype="float32")
+    embeddings = np.zeros((n_texts, dim), dtype="float32")
 
     # Собираем итоговую матрицу в исходном порядке
-    for i in range(len(texts)):
+    for i in range(n_texts):
         if i in new_vecs:
             embeddings[i] = new_vecs[i]
         elif i in cached_vecs:
             embeddings[i] = cached_vecs[i]
         else:
             # На всякий случай fallback — не должен срабатывать при нормальном сценарии
+            if verbose:
+                print(
+                    f"[encode_docs_with_cache] WARN: fallback encode для текста {i}, "
+                    "он отсутствует и в new_vecs, и в cached_vecs."
+                )
             arr = _encode_batch(emb_model, [texts[i]], normalize=normalize)
             if arr.shape[1] != dim:
                 raise ValueError(
@@ -218,6 +295,9 @@ def encode_docs_with_cache(
             if cache._can_store_more():
                 cache.doc_cache[key] = arr[0]
 
+    if verbose:
+        print(f"[encode_docs_with_cache] готово (cache). shape={embeddings.shape}")
+
     return embeddings
 
 
@@ -227,6 +307,7 @@ def encode_query_with_cache(
     model_id: str,
     cache: Optional[EmbeddingCache] = None,
     normalize: bool = True,
+    verbose: bool = False,
 ) -> np.ndarray:
     """
     Считает эмбеддинг для одного запроса (query), по возможности используя кэш.
@@ -243,6 +324,8 @@ def encode_query_with_cache(
         EmbeddingCache. Если None — кэш не используется.
     normalize:
         Нормализовать ли эмбеддинг по L2.
+    verbose:
+        Если True — печатает, был ли cache hit/miss и размер кэша.
 
     Возвращает
     ----------
@@ -250,24 +333,52 @@ def encode_query_with_cache(
         Вектор эмбеддинга shape = (1, dim).
     """
     query = query if query is not None else ""
+    use_cache = cache is not None and model_id is not None
 
-    if cache is None or model_id is None:
+    if verbose:
+        print(
+            f"[encode_query_with_cache] normalize={normalize}, "
+            f"use_cache={use_cache}, model_id={model_id!r}"
+        )
+
+    # Вариант без кэша
+    if not use_cache:
+        if verbose:
+            print("[encode_query_with_cache] cache=None или model_id=None — считаем без кэша.")
         arr = _encode_batch(emb_model, [query], normalize=normalize)
+        if verbose:
+            print(f"[encode_query_with_cache] готово (no cache). shape={arr.shape}")
         return arr
 
     key = _make_key(model_id, normalize, query)
 
+    # cache hit
     if key in cache.query_cache:
         v = cache.query_cache[key]
+        if verbose:
+            print("[encode_query_with_cache] cache hit для запроса.")
         if v.ndim == 1:
             return v.reshape(1, -1)
         return v
 
-    # Если в кэше нет — считаем и кладём
+    # cache miss
+    if verbose:
+        print("[encode_query_with_cache] cache miss для запроса — считаем и кладём в кэш.")
+
     arr = _encode_batch(emb_model, [query], normalize=normalize)
     vec = arr[0]
 
     if cache._can_store_more():
         cache.query_cache[key] = vec
+        if verbose and cache.max_size is not None:
+            print(
+                "[encode_query_with_cache] query-эмбеддинг сохранён в кэш. "
+                f"query_cache_size={len(cache.query_cache)} (max_size={cache.max_size})"
+            )
+    elif verbose and cache.max_size is not None:
+        print(
+            "[encode_query_with_cache] кэш переполнен, query-эмбеддинг не сохранён. "
+            f"query_cache_size={len(cache.query_cache)} (max_size={cache.max_size})"
+        )
 
     return arr
