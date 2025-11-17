@@ -1,17 +1,28 @@
 # vseros-toolkit
 
-### Image features (embeddings + fast stats)
-```python
-from common.features.img_index import build_from_dir
-from common.features.img_embed import build as img_embed
-from common.features.img_stats import build as img_stats
-from common.features import store, assemble
+### Models API (train_cv, blend, calibration, thresholds)
 
-id2imgs = build_from_dir("data/images", ids=[...], pattern="{id}/*.jpg", max_per_id=4)
-FS = store.FeatureStore()
-FS.add(img_stats(train, test, id_col="id", id_to_images=id2imgs))             # быстрый fallback
-FS.add(img_embed(train, test, id_col="id", id_to_images=id2imgs,              # CNN/ViT
-                 backbone="resnet50", image_size=224, agg="mean", pool="avg",
-                 device="auto", precision="auto", dtype="float16"))
-X_dense_tr, X_dense_te, catalog = assemble.make_dense(FS, include=FS.list())
+```python
+from common.models import gbdt, linear, blend, calibration, thresholds, eval as ME
+
+# 1) тренируем двух кандидатов
+run_tab = gbdt.train_cv(X_dense_tr, y, X_dense_te, folds,
+                        task="binary", lib="lightgbm",
+                        params={"n_estimators":500,"max_depth":8,"learning_rate":0.05})
+
+run_txt = linear.train_cv(X_sparse_tr, y, X_sparse_te, folds,
+                          task="binary", algo="lr", params={"C":2.0,"max_iter":200})
+
+# 2) выбираем бленд
+scorer = ME.get_scorer("binary","roc_auc")
+run_bl  = blend.equal_weight([run_tab, run_txt])  # или weight_search / ridge_level2
+
+# 3) калибруем и подбираем порог на OOF
+cal = calibration.fit(run_bl.oof_true, run_bl.oof_pred, method="platt")
+oof_prob_cal = calibration.apply(cal, run_bl.oof_pred)
+tau = thresholds.find_global_tau(run_bl.oof_true, oof_prob_cal, scorer)
+
+# 4) применяем к test
+test_prob_cal = calibration.apply(cal, run_bl.test_pred)
+# далее — τ или top-K в 04_eval_post
 ```
